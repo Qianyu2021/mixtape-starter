@@ -116,3 +116,114 @@ first-ever listen      => streak = 1  (expected 1)    # never-listened user star
 ```
 
 All four of the documented streak rules still hold, and the reset-on-gap and same-day-no-op behaviors are unaffected — the only behavior that changed is that consecutive-day listens landing on a Sunday now correctly increment.
+
+## Issue #2 — "Friends Listening Now shows people from yesterday"
+
+Reported symptom: the "Friends Listening Now" feed lists friends who listened hours ago — even people who last listened *yesterday* — instead of only those listening right now.
+
+### How I reproduced it
+
+Before changing code I set up three friends with listens at different ages and called `get_friends_listening_now(user_id)`:
+
+1. Friend A listened **10 minutes ago** → should appear ("listening now").
+2. Friend B listened **2 hours ago** (earlier today) → should NOT appear.
+3. Friend C listened **18 hours ago** (yesterday) → should NOT appear.
+
+With the original code all three came back:
+
+```
+BEFORE (24h)   -> ['recent_10min', 'older_2h', 'yesterday_18h']
+```
+
+Friends B and C are exactly the "people from yesterday" the report complained about, confirming the bug.
+
+### How I found the root cause
+
+- The README issue table pointed me at `services/feed_service.py`.
+- I read `get_friends_listening_now` and saw the recency filter `ListeningEvent.listened_at >= cutoff`, where `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`. The SQL filter and dedup logic were correct, so the only thing that could widen the window was the threshold constant itself.
+- The deciding moment was the module-level constant `RECENT_THRESHOLD = timedelta(hours=24)` combined with the intent baked into `seed_data.py`. The seed file explicitly documents the expected window: recent events are created "within the past 30 minutes — should appear in 'listening now'" ([seed_data.py:111](seed_data.py#L111)) while older events are "1–14 days ago — should NOT appear in 'listening now' after fix" ([seed_data.py:121](seed_data.py#L121)). That mismatch — a 24-hour threshold versus a documented 30-minute window — pinpointed the exact defect, not just a suspicious area.
+
+### The root cause
+
+`RECENT_THRESHOLD` was set to **24 hours**. "Friends Listening Now" is supposed to show only friends listening *right now* (within the last 30 minutes), but a 24-hour cutoff means any friend who listened at any point in the previous day still satisfies `listened_at >= now - 24h`. So a friend who played a song yesterday evening keeps appearing in the "now" feed all the way until 24 hours later. The window was simply ~48× too large for what the feature promises.
+
+### The fix and side-effect check
+
+Changed [services/feed_service.py:13](services/feed_service.py#L13):
+
+```diff
+- RECENT_THRESHOLD = timedelta(hours=24)
++ RECENT_THRESHOLD = timedelta(minutes=30)
+```
+
+This matches the 30-minute window the seed data documents, so events older than 30 minutes (earlier today or yesterday) are excluded while genuinely-current listens still show. Re-running the reproduction:
+
+```
+AFTER (30min)  -> ['recent_10min']            # only the friend listening now
+activity_feed  -> ['recent_10min', 'earlier_today_2h', 'yesterday_18h']   # unchanged
+dedup: entries for recent friend = 1          # one row per friend, most recent
+```
+
+Side-effect checks:
+- **`get_activity_feed`** — intentionally *not* recency-filtered — still returns older events (it only orders by recency and limits count), so the general activity history is unaffected by the threshold change.
+- **Dedup / ordering** in `get_friends_listening_now` still returns exactly one entry per friend (their most recent listen), so the fix narrows the time window without disturbing how results are grouped or sorted.
+- **Empty cases** (no friends / no recent listens) still return `[]`.
+
+## Issue #3 — "The same song keeps showing up twice in search"
+
+Reported symptom: searching for a song returns the same song multiple times in the results list.
+
+### How I reproduced it
+
+Before touching code I created a song with three tags and searched for it. The `search_songs` query joins the `song_tags` association table, so at the SQL level the row set fans out to one row per tag. I confirmed this directly:
+
+```
+raw SQL rows for a 3-tag song matching the query: 3   # 'Crown Heights Anthem' x3
+```
+
+The bundled test `tests/test_search.py::test_search_no_duplicates_multi_tag_song` documents the same expectation ("Should be 1, bug causes it to be 3"). One nuance worth recording: on the installed SQLAlchemy (2.0.51), the *legacy* `Query.all()` path happens to de-duplicate whole-entity results by identity, which masks the duplicate when selecting full `Song` objects. But the fan-out is real and surfaces the moment uniquing doesn't apply — e.g. selecting a column:
+
+```
+title rows via join (buggy): ['Crown Heights Anthem', 'Crown Heights Anthem', 'Crown Heights Anthem']
+```
+
+…and it would surface directly to users on any SQLAlchemy version or query style (2.0 `select().scalars()`, `.count()`, older releases) that doesn't silently unique the rows. So the query was latently broken regardless of the accidental masking.
+
+### How I found the root cause
+
+- The README issue table pointed me at `services/search_service.py`.
+- Reading `search_songs`, the filter only matches on `Song.title` / `Song.artist` — yet the query also did `.outerjoin(song_tags, Song.id == song_tags.c.song_id)`. Nothing in the query references the joined `song_tags` rows for filtering or selection.
+- The confirming moment was checking `Song.to_dict()` in `models.py`: tags are serialized via `self.tags`, which is a `db.relationship("Tag", secondary=song_tags, lazy="subquery")` ([models.py:90](models.py#L90)). Tags are loaded by that relationship completely independently of the search query. That proved the `outerjoin` in `search_songs` contributes nothing to the output — its *only* effect is to multiply result rows by each song's tag count. That's the precise cause, not just a suspicious line.
+
+### The root cause
+
+`search_songs` performed an `OUTER JOIN` against the `song_tags` association table but never used it — no tag filter, no tag columns selected. A relational join emits one row per matching pair, so a song with N tags produced N identical rows. The intent was presumably to make tags available, but tags already come from the `Song.tags` relationship inside `to_dict()`, making the join both redundant and the direct source of the duplicates.
+
+### The fix and side-effect check
+
+Changed [services/search_service.py](services/search_service.py) — removed the unused join (and the now-unused `Tag`, `song_tags` imports):
+
+```diff
+- from models import Song, Tag, song_tags
++ from models import Song
+
+  results = (
+      db.session.query(Song)
+-     .outerjoin(song_tags, Song.id == song_tags.c.song_id)
+      .filter(
+          db.or_(
+              Song.title.ilike(f"%{query}%"),
+              Song.artist.ilike(f"%{query}%"),
+          )
+      )
+      .all()
+  )
+```
+
+Without the join the query returns exactly one row per matching song, so no version- or query-style-dependent uniquing is required to get correct results.
+
+Side-effect checks:
+- **Tags still present** — a search result for the 3-tag song still includes `['rap', 'hip-hop', 'boom bap']`, confirming `to_dict()`'s relationship-based tag loading is unaffected by removing the join.
+- **Search test suite** — all 5 tests in `tests/test_search.py` pass (matching, empty-result, and the no-duplicate cases for zero/one/three tags).
+- **Duplicate gone at the row level** — the previously-duplicating scenario now returns a single row, so the fix holds even where entity uniquing wouldn't have saved it.
+- The two failures in `tests/test_playlists.py` are unrelated to this change (they stem from the still-open Issue #5 in `playlist_service.py`, which this fix does not touch).
