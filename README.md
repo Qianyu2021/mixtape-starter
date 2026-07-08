@@ -43,7 +43,7 @@ Create and activate a virtual environment:
 ```bash
 python -m venv .venv
 
-# macOS / Linux
+# macOS 
 source .venv/bin/activate
 
 # Windows (Command Prompt)
